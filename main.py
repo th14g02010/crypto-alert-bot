@@ -5,7 +5,7 @@ import requests
 from google.oauth2 import service_account
 import google.auth.transport.requests
 
-SERVICE_ACCOUNT_FILE = "cryptojaspion-firebase-adminsdk-fbs-vc-c31bb4e2c2.json"
+SERVICE_ACCOUNT_FILE = "cryptojaspion-firebase-adminsdk-fbsvc-c31bb4e2c2.json"
 TARGET = "/topics/all"
 
 credentials = service_account.Credentials.from_service_account_file(
