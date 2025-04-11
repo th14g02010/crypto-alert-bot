@@ -1,13 +1,13 @@
-
 import time
 import json
 import requests
 from google.oauth2 import service_account
 import google.auth.transport.requests
 
+# Caminho para o Secret File seguro no Render
 SERVICE_ACCOUNT_FILE = "/etc/secrets/serviceAccount.json"
-TARGET = "/topics/all"
 
+# Autentica com as credenciais do Firebase
 credentials = service_account.Credentials.from_service_account_file(
     SERVICE_ACCOUNT_FILE,
     scopes=["https://www.googleapis.com/auth/firebase.messaging"]
@@ -42,5 +42,6 @@ def send_push_notification(title, body):
 
 if __name__ == "__main__":
     while True:
-        send_push_notification("Alerta Crypto", "Bitcoin está próximo do ATH!")
-        time.sleep(3600)
+        print("Enviando alerta...")  # Log de teste
+        send_push_notification("Alerta Crypto", "Bitcoin está perto do ATH!")
+        time.sleep(600)  # Espera 10 minutos antes de enviar o próximo alerta
