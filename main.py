@@ -46,7 +46,7 @@ try:
         while True:
             print("Enviando alerta...")
             send_push_notification("Alerta Crypto", "Bitcoin está perto do ATH!")
-            time.sleep(600)
+            time.sleep(10)
 
 except Exception as e:
     print(f"Erro detectado: {e}")
