@@ -14,9 +14,9 @@ CHECK_INTERVAL = int(os.getenv('CHECK_INTERVAL', '1800'))  # 30 minutos
 
 app = Flask(__name__)
 
-# ================== FUNÇÕES DE API MELHORADAS ==================
+# ================== FUNÇÕES DE API ==================
 def get_binance_candles(symbol, interval, limit=21):
-    """Obtém candles da Binance com tratamento de erros completo"""
+    """Obtém candles da Binance com tratamento de erros"""
     BINANCE_URLS = [
         "https://api.binance.com",
         "https://api1.binance.com",
@@ -43,18 +43,16 @@ def get_binance_candles(symbol, interval, limit=21):
                 timeout=15
             )
             
-            # Verifica se a resposta é JSON válido
-            if response.text.strip() and not response.text.startswith(('<!DOCTYPE', '<html')):
+            if response.status_code == 200 and not response.text.startswith(('<!DOCTYPE', '<html')):
                 data = response.json()
-                if isinstance(data, list):
-                    return [{
-                        "open": float(c[1]),
-                        "high": float(c[2]),
-                        "low": float(c[3]),
-                        "close": float(c[4]),
-                        "time": datetime.fromtimestamp(c[0]/1000).strftime('%Y-%m-%d %H:%M'),
-                        "source": "Binance"
-                    } for c in data]
+                return [{
+                    "open": float(c[1]),
+                    "high": float(c[2]),
+                    "low": float(c[3]),
+                    "close": float(c[4]),
+                    "time": datetime.fromtimestamp(c[0]/1000).strftime('%Y-%m-%d %H:%M'),
+                    "source": "Binance"
+                } for c in data]
                 
         except Exception as e:
             print(f"Erro na Binance ({base_url}): {str(e)[:100]}")
@@ -62,77 +60,116 @@ def get_binance_candles(symbol, interval, limit=21):
     
     return None
 
-def get_bybit_candles(symbol, interval, limit=21):
-    """API da Bybit com tratamento de erros reforçado"""
+def get_kucoin_candles(symbol, interval, limit=21):
+    """Fallback para API da KuCoin quando Binance falha"""
     try:
-        # Mapeamento de intervalos
         interval_map = {
-            '1m': '1', '3m': '3', '5m': '5', '15m': '15',
-            '30m': '30', '1h': '60', '2h': '120', '4h': '240',
-            '6h': '360', '12h': '720', '1d': 'D', '1w': 'W'
+            '1m': '1min', '5m': '5min', '15m': '15min',
+            '30m': '30min', '1h': '1hour', '4h': '4hour',
+            '6h': '6hour', '12h': '12hour', '1d': '1day'
         }
         
-        # Verifica se o símbolo precisa de ajuste (ex: SOLUSDT → SOLUSDT)
-        bybit_symbol = symbol.replace('/', '') if '/' in symbol else symbol
-        
         response = requests.get(
-            "https://api.bybit.com/v5/market/kline",
+            "https://api.kucoin.com/api/v1/market/candles",
             params={
-                "category": "spot",
-                "symbol": bybit_symbol,
-                "interval": interval_map.get(interval, '60'),
-                "limit": str(limit)
+                "symbol": symbol.replace('/', '-'),
+                "type": interval_map.get(interval, '1hour'),
+                "limit": limit
             },
-            headers={'User-Agent': 'Mozilla/5.0'},
             timeout=15
         )
         
-        # Debug: Verifique a resposta bruta
-        print(f"Bybit Response: {response.status_code} - {response.text[:200]}...")
-        
         if response.status_code == 200:
             data = response.json()
-            if data.get("result") and data["result"].get("list"):
+            if data.get("data"):
                 return [{
-                    "open": float(c["open"]),
-                    "high": float(c["high"]),
-                    "low": float(c["low"]),
-                    "close": float(c["close"]),
-                    "time": datetime.fromtimestamp(int(c["startTime"])/1000).strftime('%Y-%m-%d %H:%M'),
-                    "source": "Bybit"
-                } for c in data["result"]["list"]]
-            else:
-                print("Bybit: Estrutura de dados inválida")
-        else:
-            print(f"Bybit API Error: {response.status_code} - {response.text}")
-            
+                    "open": float(c[1]),
+                    "high": float(c[2]),
+                    "low": float(c[3]),
+                    "close": float(c[4]),
+                    "time": datetime.fromtimestamp(int(c[0])).strftime('%Y-%m-%d %H:%M'),
+                    "source": "KuCoin"
+                } for c in data["data"]]
+                
     except Exception as e:
-        print(f"Erro crítico na Bybit API: {str(e)}")
+        print(f"Erro na KuCoin API: {str(e)[:100]}")
     
     return None
 
 def get_candles(symbol=SYMBOL, interval=INTERVAL, limit=21):
-    """Obtém dados com fallback inteligente"""
-    print(f"\n🔄 Obtendo candles ({symbol} {interval})...")
-    
-    # Tenta Binance primeiro
+    """Obtém dados com fallback para KuCoin"""
     candles = get_binance_candles(symbol, interval, limit)
-    
-    # Fallback para Bybit se necessário
     if not candles:
-        print("🔁 Binance falhou, tentando Bybit...")
-        candles = get_bybit_candles(symbol, interval, limit)
-    
+        print("🔁 Binance falhou, tentando KuCoin...")
+        candles = get_kucoin_candles(symbol, interval, limit)
     return candles or []
 
-# ... (mantenha o resto do código igual: send_telegram_alert, analyze_market, etc.)
+# ================== LÓGICA DO BOT ==================
+def send_telegram_alert(message):
+    """Envia alertas para o Telegram"""
+    if not TELEGRAM_TOKEN or not CHAT_ID:
+        print("⚠️ Token ou Chat ID do Telegram não configurados!")
+        return
+    
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        requests.post(url, json={
+            "chat_id": CHAT_ID,
+            "text": message,
+            "parse_mode": "Markdown"
+        }, timeout=5)
+    except Exception as e:
+        print(f"Erro no Telegram: {str(e)[:100]}")
 
+def analyze_market():
+    """Analisa o mercado e envia alertas"""
+    candles = get_candles()
+    if not candles:
+        print("❌ Não foi possível obter dados do mercado")
+        return False
+
+    last_candle = candles[-1]
+    message = (
+        f"📊 **Dados do Mercado** ({SYMBOL})\n\n"
+        f"🕒 Hora: {last_candle['time']}\n"
+        f"💰 Preço: ${last_candle['close']:.4f}\n"
+        f"📈 Alta: ${last_candle['high']:.4f}\n"
+        f"📉 Baixa: ${last_candle['low']:.4f}\n"
+        f"🔍 Fonte: {last_candle['source']}"
+    )
+    send_telegram_alert(message)
+    return True
+
+def trading_loop():
+    """Loop principal de trading"""
+    print("\n🤖 Bot iniciado. Pressione Ctrl+C para sair.")
+    while True:
+        try:
+            analyze_market()
+            time.sleep(CHECK_INTERVAL)
+        except Exception as e:
+            print(f"Erro no loop principal: {str(e)[:100]}")
+            time.sleep(60)
+
+# ================== ROTAS FLASK ==================
+@app.route('/')
+def health_check():
+    return jsonify({
+        "status": "online",
+        "symbol": SYMBOL,
+        "interval": INTERVAL,
+        "last_check": datetime.now().isoformat()
+    })
+
+# ================== INICIALIZAÇÃO ==================
 if __name__ == "__main__":
     # Teste rápido das APIs
-    print("=== TESTE DE API ===")
-    print("Binance:", len(get_binance_candles(SYMBOL, INTERVAL, 1)) if get_binance_candles(SYMBOL, INTERVAL, 1) else "Binance falhou")
-    print("Bybit:", len(get_bybit_candles(SYMBOL, INTERVAL, 1)) if get_bybit_candles(SYMBOL, INTERVAL, 1) else "Bybit falhou")
+    print("=== TESTE DE CONEXÃO ===")
+    print("Binance:", "OK" if get_binance_candles(SYMBOL, INTERVAL, 1) else "Falhou")
+    print("KuCoin:", "OK" if get_kucoin_candles(SYMBOL, INTERVAL, 1) else "Falhou")
     
-    # Inicia aplicação
+    # Inicia o bot em thread separada
     Thread(target=trading_loop, daemon=True).start()
+    
+    # Inicia o servidor Flask (obrigatório no Render)
     app.run(host='0.0.0.0', port=8000)
