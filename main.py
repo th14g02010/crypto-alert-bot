@@ -1,11 +1,10 @@
 import requests
 import time
-from decimal import Decimal  # Usar Decimal para precisão numérica
 
 TELEGRAM_TOKEN = "7851489296:AAGdtlr5tlRWtZQ4DGAFligu0lx7CQhjmkM"
 CHAT_ID = "6197066344"
 
-last_signal = None
+last_signal = None  # evitar alertas duplicados
 
 def send_telegram_alert(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -17,47 +16,40 @@ def send_telegram_alert(message):
 
 def get_candles(symbol="SOL-USDT", interval="1hour", limit=21):
     url = "https://api.kucoin.com/api/v1/market/candles"
-    params = {"symbol": symbol, "type": interval, "limit": limit}
+    params = {"symbol": symbol, "type": interval}
     try:
         response = requests.get(url, params=params, timeout=10)
         response.raise_for_status()
-        data = response.json()
-        if data.get("code") == "200000" and isinstance(data.get("data"), list):
-            candles_data = data["data"]
-            candles_data.reverse()  # KuCoin retorna candles mais recentes primeiro; invertemos
-            return [
-                {
-                    "open": Decimal(c[1]),
-                    "high": Decimal(c[2]),
-                    "low": Decimal(c[3]),
-                    "close": Decimal(c[4])
-                } for c in candles_data
-            ]
+        data = response.json()["data"]
+        if isinstance(data, list):
+            candles = []
+            for c in reversed(data[-limit:]):
+                candles.append({
+                    "open": float(c[1]),
+                    "close": float(c[2]),
+                    "high": float(c[3]),
+                    "low": float(c[4])
+                })
+            return candles
         else:
-            raise ValueError(f"Resposta inválida da KuCoin: {data.get('msg')}")
+            raise ValueError("Resposta inesperada da API KuCoin")
     except Exception as e:
-        print(f"Erro ao obter candles: {e}")
+        print(f"Erro ao obter candles KuCoin: {e}")
         return []
 
 def get_trend(candles):
     closes = [c["close"] for c in candles[:-1]]
     if len(closes) < 20:
         return "indefinida"
-    avg_old = sum(closes[:10]) / Decimal(10)
-    avg_new = sum(closes[10:]) / Decimal(10)
+    avg_old = sum(closes[:10]) / 10
+    avg_new = sum(closes[10:]) / 10
     return "up" if avg_new > avg_old else "down"
 
 def detect_engulfing(c1, c2, type="bullish"):
     if type == "bullish":
-        return (c1["close"] < c1["open"] and 
-                c2["close"] > c2["open"] and 
-                c2["close"] > c1["open"] and 
-                c2["open"] < c1["close"])
+        return c1["close"] < c1["open"] and c2["close"] > c2["open"] and c2["close"] > c1["open"] and c2["open"] < c1["close"]
     elif type == "bearish":
-        return (c1["close"] > c1["open"] and 
-                c2["close"] < c2["open"] and 
-                c2["open"] > c1["close"] and 
-                c2["close"] < c1["open"])
+        return c1["close"] > c1["open"] and c2["close"] < c2["open"] and c2["open"] > c1["close"] and c2["close"] < c1["open"]
     return False
 
 def main_loop():
@@ -70,21 +62,31 @@ def main_loop():
             continue
 
         trend = get_trend(candles)
-        trend_text = "🔺 Alta" if trend == "up" else "🔻 Baixa" if trend == "down" else "❓ Indefinida"
+        trend_text = "Alta" if trend == "up" else "Baixa" if trend == "down" else "Indefinida"
 
         c1 = candles[-2]
         c2 = candles[-1]
         current_price = c2["close"]
 
         try:
-            # Engolfo de Alta
             if detect_engulfing(c1, c2, "bullish") and last_signal != "bullish":
-                entry = current_price.quantize(Decimal("0.0001"))  # Ajuste conforme o tick size do ativo
-                tp = (entry * Decimal("1.03")).quantize(Decimal("0.0001"))
-                sl = (entry * Decimal("0.985")).quantize(Decimal("0.0001"))
-                msg = f"""🚨 [ALERTA] Engolfo de Alta detectado em SOL/USDT (1H)
+                entry = round(current_price, 2)
+                tp = round(entry * 1.03, 2)
+                sl = round(entry * 0.985, 2)
+                msg = f"[ALERTA] Engolfo de Alta detectado em SOL/USDT (1H)\n\nTipo de entrada: Compra\nPreço de entrada: ${entry}\nTake Profit (TP): ${tp} (+3%)\nStop Loss (SL): ${sl} (-1.5%)\n\nTendência principal: {trend_text}"
+                send_telegram_alert(msg)
+                last_signal = "bullish"
 
-🟢 Tipo de entrada: Compra
-💰 Preço de entrada: ${entry}
-🎯 Take Profit (TP): ${tp} (+3%)
-🛡️ Stop Loss (SL): ${sl} (-1.5
+            elif detect_engulfing(c1, c2, "bearish") and last_signal != "bearish":
+                msg = f"[ALERTA] Engolfo de Baixa detectado em SOL/USDT (1H)\n\nTipo de sinal: Reversão de alta ou saída\nPreço atual: ${round(current_price, 2)}\nTendência principal: {trend_text}"
+                send_telegram_alert(msg)
+                last_signal = "bearish"
+
+        except Exception as e:
+            print("Erro na análise ou envio:", e)
+
+        time.sleep(1800)
+
+if __name__ == "__main__":
+    print("Bot de alerta SOL/USDT (KuCoin) iniciado...")
+    main_loop()
