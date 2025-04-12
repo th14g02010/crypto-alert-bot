@@ -9,17 +9,40 @@ from flask import Flask, jsonify
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
 CHAT_ID = os.getenv('CHAT_ID')
 SYMBOL = os.getenv('SYMBOL', 'BTC-USDT')  # Formato KuCoin
-INTERVAL = os.getenv('INTERVAL', '1hour')  # KuCoin usa '1hour' em vez de '1h'
+INTERVAL = os.getenv('INTERVAL', '1hour')  # Valores corretos: 1min, 5min, 15min, 30min, 1hour, 6hour, 1day
 CHECK_INTERVAL = int(os.getenv('CHECK_INTERVAL', '1800'))  # 30 minutos
 
 app = Flask(__name__)
 
 # ================== FUNÇÕES DA API KUCOIN ==================
+def get_valid_intervals():
+    """Retorna os intervalos válidos para a KuCoin API"""
+    return {
+        '1m': '1min', '3m': '3min', '5m': '5min', '15m': '15min', '30m': '30min',
+        '1h': '1hour', '2h': '2hour', '4h': '4hour', '6h': '6hour', '12h': '12hour',
+        '1d': '1day', '1w': '1week'
+    }
+
+def normalize_interval(interval):
+    """Converte intervalos comuns para o formato KuCoin"""
+    interval_map = get_valid_intervals()
+    return interval_map.get(interval.lower(), interval)
+
+def verify_symbol(symbol):
+    """Verifica se o símbolo está no formato correto (ex: BTC-USDT)"""
+    if '-' not in symbol:
+        print(f"⚠️ Símbolo {symbol} não está no formato KuCoin (MOEDA-BASE)")
+        return symbol.replace('/', '-') if '/' in symbol else f"{symbol}-USDT"
+    return symbol
+
 def get_candles(symbol=SYMBOL, interval=INTERVAL, limit=21):
-    """Obtém candles da KuCoin com monitoramento detalhado"""
+    """Obtém candles da KuCoin com tratamento robusto de erros"""
     try:
-        print(f"\n📡 Buscando dados da KuCoin... | Par: {symbol} | Intervalo: {interval}")
-        start_time = time.time()
+        # Normaliza os parâmetros
+        symbol = verify_symbol(symbol)
+        interval = normalize_interval(interval)
+        
+        print(f"\n📡 Buscando {limit} candles de {symbol} no intervalo {interval}")
         
         url = "https://api.kucoin.com/api/v1/market/candles"
         params = {
@@ -29,47 +52,56 @@ def get_candles(symbol=SYMBOL, interval=INTERVAL, limit=21):
         }
         
         response = requests.get(url, params=params, timeout=15)
-        response_time = time.time() - start_time
+        response.raise_for_status()
+        data = response.json()
         
-        print(f"⏱️ Tempo de resposta: {response_time:.2f}s | Status: {response.status_code}")
-        
-        if response.status_code == 200:
-            data = response.json()
-            if data.get("code") == "200000":
-                candles = []
-                for candle in data["data"]:
-                    candles.append({
-                        "open": float(candle[1]),
-                        "high": float(candle[2]),
-                        "low": float(candle[3]),
-                        "close": float(candle[4]),
-                        "volume": float(candle[5]),
-                        "time": datetime.fromtimestamp(int(candle[0])).strftime('%Y-%m-%d %H:%M'),
-                        "source": "KuCoin"
-                    })
-                print(f"✅ Dados recebidos: {len(candles)} candles")
-                return candles[::-1]  # Inverte para ordem cronológica
+        # Tratamento específico para erros da KuCoin
+        if data.get("code") != "200000":
+            error_msg = data.get("msg", "Erro desconhecido")
+            if "Incorrect candlestick type" in error_msg:
+                print(f"❌ Intervalo inválido: {interval}. Use: {', '.join(get_valid_intervals().values())}")
             else:
-                print(f"❌ Erro na API: {data.get('msg', 'Sem mensagem de erro')}")
-        else:
-            print(f"⚠️ Status code inválido: {response.status_code}")
+                print(f"❌ Erro na API: {error_msg}")
+            return None
             
+        if not data.get("data"):
+            print("⚠️ Nenhum dado retornado pela API")
+            return None
+            
+        candles = []
+        for candle in data["data"]:
+            try:
+                candles.append({
+                    "open": float(candle[1]),
+                    "high": float(candle[2]),
+                    "low": float(candle[3]),
+                    "close": float(candle[4]),
+                    "volume": float(candle[5]),
+                    "time": datetime.fromtimestamp(int(candle[0])).strftime('%Y-%m-%d %H:%M'),
+                    "source": "KuCoin"
+                })
+            except (IndexError, ValueError) as e:
+                print(f"⚠️ Erro ao processar candle: {str(e)}")
+                continue
+                
+        print(f"✅ {len(candles)} candles obtidos com sucesso")
+        return candles[::-1]  # Inverte para ordem cronológica
+        
+    except requests.exceptions.RequestException as e:
+        print(f"🌐 Erro na requisição: {str(e)[:100]}")
     except Exception as e:
-        print(f"🔥 Erro na requisição: {str(e)[:100]}")
-    
+        print(f"🔥 Erro inesperado: {str(e)}")
+        
     return None
 
 # ================== LÓGICA DO BOT ==================
 def send_alert(message):
-    """Envia alertas para o Telegram com logging"""
+    """Envia alertas para o Telegram com tratamento de erros"""
     if not TELEGRAM_TOKEN or not CHAT_ID:
-        print("⛔ Telegram não configurado")
+        print("⛔ Telegram não configurado - alerta não enviado")
         return False
         
     try:
-        print("\n✉️ Enviando alerta para Telegram...")
-        start_time = time.time()
-        
         response = requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
             json={
@@ -79,55 +111,58 @@ def send_alert(message):
             },
             timeout=10
         )
-        
-        print(f"📨 Status: {response.status_code} | Tempo: {time.time() - start_time:.2f}s")
         return response.status_code == 200
-        
     except Exception as e:
-        print(f"⚠️ Falha no Telegram: {str(e)[:50]}")
+        print(f"⚠️ Erro no Telegram: {str(e)[:50]}")
         return False
 
 def analyze_market():
-    """Analisa o mercado com logging detalhado"""
+    """Analisa o mercado com tratamento robusto"""
     print("\n🔍 Iniciando análise de mercado...")
-    analysis_start = time.time()
+    start_time = time.time()
     
     candles = get_candles()
     if not candles or len(candles) < 2:
         print("⛔ Dados insuficientes para análise")
         return False
-    
+        
     last_candle = candles[-1]
     prev_candle = candles[-2]
     
-    # Cálculos
-    price_change = ((last_candle['close'] - prev_candle['close']) / prev_candle['close']) * 100
-    candle_type = "🟢 Alta" if last_candle['close'] > last_candle['open'] else "🔴 Baixa"
-    volume_change = ((last_candle['volume'] - prev_candle['volume']) / prev_candle['volume']) * 100
+    # Cálculos com tratamento de divisão por zero
+    try:
+        price_change_pct = ((last_candle['close'] - prev_candle['close']) / prev_candle['close']) * 100
+        volume_change_pct = ((last_candle['volume'] - prev_candle['volume']) / prev_candle['volume']) * 100
+    except ZeroDivisionError:
+        price_change_pct = 0
+        volume_change_pct = 0
     
-    # Construção da mensagem
+    # Formatação dos valores
+    price_change_str = f"+{price_change_pct:.2f}%" if price_change_pct >= 0 else f"{price_change_pct:.2f}%"
+    volume_change_str = f"+{volume_change_pct:.1f}%" if volume_change_pct >= 0 else f"{volume_change_pct:.1f}%"
+    
     message = (
         f"📊 **{SYMBOL.replace('-', '/')} {INTERVAL}**\n"
-        f"⏰ {last_candle['time']} | {candle_type}\n"
-        f"💰 Preço: ${last_candle['close']:.4f}\n"
-        f"📈 Variação: {price_change:+.2f}%\n"
-        f"💨 Volume: {last_candle['volume']:.2f} ({volume_change:+.1f}%)\n"
-        f"🔄 Fonte: KuCoin API"
+        f"⏰ {last_candle['time']}\n"
+        f"💰 Preço: ${last_candle['close']:.4f} ({price_change_str})\n"
+        f"📈 Volume: {last_candle['volume']:.2f} ({volume_change_str})\n"
+        f"🔍 Fonte: KuCoin API"
     )
     
-    # Envio do alerta
-    alert_result = send_alert(message)
-    print(f"⏳ Análise concluída em {time.time() - analysis_start:.2f}s")
+    if send_alert(message):
+        print(f"✅ Análise concluída em {time.time() - start_time:.2f}s")
+        return True
     
-    return alert_result
+    print("⛔ Falha ao enviar alerta")
+    return False
 
 def trading_loop():
     """Loop principal com monitoramento detalhado"""
     print("\n🤖 Iniciando KuCoin Trading Bot")
-    print(f"⚙️ Configuração:")
+    print(f"⚙️ Configuração atual:")
     print(f"• Par: {SYMBOL}")
     print(f"• Intervalo: {INTERVAL}")
-    print(f"• Ciclo: {CHECK_INTERVAL//60} minutos\n")
+    print(f"• Ciclo: {CHECK_INTERVAL//60} minutos")
     
     cycle = 0
     while True:
@@ -138,11 +173,10 @@ def trading_loop():
             print(f"\n♻️ CICLO #{cycle} | {datetime.now().strftime('%d/%m %H:%M:%S')}")
             
             if analyze_market():
-                print("✅ Ciclo concluído com sucesso")
+                print("✅ Análise concluída com sucesso")
             else:
-                print("⚠️ Problemas detectados neste ciclo")
+                print("⚠️ Problemas na análise")
             
-            # Gerenciamento do tempo do ciclo
             elapsed = time.time() - cycle_start
             sleep_time = max(CHECK_INTERVAL - elapsed, 5)
             print(f"⏳ Próximo ciclo em {sleep_time:.0f}s")
@@ -150,7 +184,7 @@ def trading_loop():
             
         except Exception as e:
             print(f"🔥 ERRO CRÍTICO: {str(e)}")
-            print("🛑 Esperando 1 minuto antes de retomar...")
+            print("🛑 Esperando 60 segundos antes de retomar...")
             time.sleep(60)
 
 # ================== WEB SERVICE ==================
@@ -162,11 +196,8 @@ def status():
         "exchange": "KuCoin",
         "symbol": SYMBOL,
         "interval": INTERVAL,
-        "last_check": datetime.now().isoformat(),
-        "endpoints": {
-            "health": "/health",
-            "docs": "https://docs.kucoin.com"
-        }
+        "valid_intervals": list(get_valid_intervals().values()),
+        "timestamp": datetime.now().isoformat()
     })
 
 @app.route('/health')
@@ -175,18 +206,13 @@ def health_check():
     test_start = time.time()
     
     # Teste da API
-    api_status = False
-    try:
-        test_data = get_candles(limit=1)
-        api_status = bool(test_data)
-    except:
-        pass
+    api_test = get_candles(limit=1) is not None
     
     # Teste do Telegram
-    telegram_status = False
+    telegram_test = False
     if TELEGRAM_TOKEN and CHAT_ID:
         try:
-            telegram_status = requests.get(
+            telegram_test = requests.get(
                 f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getMe",
                 timeout=5
             ).status_code == 200
@@ -194,9 +220,9 @@ def health_check():
             pass
     
     return jsonify({
-        "healthy": api_status and telegram_status,
-        "api_online": api_status,
-        "telegram_online": telegram_status,
+        "healthy": api_test and telegram_test,
+        "api_online": api_test,
+        "telegram_online": telegram_test,
         "response_time_ms": int((time.time() - test_start) * 1000),
         "timestamp": datetime.now().isoformat()
     })
@@ -205,12 +231,12 @@ def health_check():
 if __name__ == "__main__":
     # Banner de inicialização
     print("\n" + "=" * 50)
-    print(f"🚀 INICIANDO KUCOIN TRADING BOT")
+    print(f"🚀 KUCOIN TRADING BOT")
     print(f"🕒 {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}")
-    print("=" * 50 + "\n")
+    print("=" * 50)
     
     # Verificação inicial
-    print("⚙️ Executando verificações iniciais...")
+    print("\n⚙️ Executando verificações iniciais...")
     print(f"• Testando conexão com KuCoin API...", end=" ")
     test_candles = get_candles(limit=1)
     print("✅ OK" if test_candles else "❌ FALHA")
@@ -218,20 +244,4 @@ if __name__ == "__main__":
     print(f"• Verificando Telegram...", end=" ")
     if TELEGRAM_TOKEN and CHAT_ID:
         try:
-            telegram_test = requests.get(
-                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getMe",
-                timeout=5
-            ).status_code == 200
-            print("✅ OK" if telegram_test else "❌ FALHA")
-        except:
-            print("⚠️ ERRO")
-    else:
-        print("⏭️ DESATIVADO")
-    
-    # Inicia serviços
-    print("\n🔧 Iniciando serviços...")
-    Thread(target=trading_loop, daemon=True).start()
-    print("✅ Thread do trading iniciada")
-    
-    print("🌐 Iniciando servidor web...")
-    app.run(host='0.0.0.0', port=8000, use_reloader=False)
+            telegram_test = req
