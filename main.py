@@ -76,7 +76,6 @@ def main_loop():
         current_price = c2["close"]
 
         try:
-            # Engolfo de Alta
             if detect_engulfing(c1, c2, "bullish"):
                 print("[INFO] Padrão Engolfo de Alta detectado")
                 if last_signal != "bullish":
@@ -89,11 +88,13 @@ def main_loop():
                 else:
                     print("[INFO] Engolfo de Alta já foi sinalizado. Nenhum novo alerta.")
 
-            # Engolfo de Baixa
             elif detect_engulfing(c1, c2, "bearish"):
                 print("[INFO] Padrão Engolfo de Baixa detectado")
                 if last_signal != "bearish":
-                    msg = f"[ALERTA] Engolfo de Baixa detectado em SOL/USDT (1H)\n\nTipo de sinal: Reversão de alta ou saída\nPreço atual: ${round(current_price, 2)}\nTendência principal: {trend_text}"
+                    exit_price = round(current_price, 2)
+                    tp = round(exit_price * 0.97, 2)
+                    sl = round(exit_price * 1.015, 2)
+                    msg = f"[ALERTA] Engolfo de Baixa detectado em SOL/USDT (1H)\n\nTipo de sinal: Saída ou venda\nPreço de saída: ${exit_price}\nAlvo de lucro: ${tp} (-3%)\nStop Loss: ${sl} (+1.5%)\n\nTendência principal: {trend_text}"
                     send_telegram_alert(msg)
                     last_signal = "bearish"
                 else:
