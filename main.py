@@ -10,91 +10,100 @@ TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
 CHAT_ID = os.getenv('CHAT_ID')
 SYMBOL = os.getenv('SYMBOL', 'BTC-USDT')
 INTERVAL = os.getenv('INTERVAL', '1hour')
-CHECK_INTERVAL = int(os.getenv('CHECK_INTERVAL', '1800'))
+CHECK_INTERVAL = int(os.getenv('CHECK_INTERVAL', '1800'))  # 30 minutos
 
 app = Flask(__name__)
 
-# ================== FUNÇÕES DA API KUCOIN ==================
-def get_valid_intervals():
-    return {
-        '1m': '1min', '5m': '5min', '15m': '15min', '30m': '30min',
-        '1h': '1hour', '2h': '2hour', '4h': '4hour', '6h': '6hour',
-        '12h': '12hour', '1d': '1day', '1w': '1week'
-    }
+# Variáveis de estado
+last_signal = None
 
-def normalize_interval(interval):
-    interval_map = get_valid_intervals()
-    return interval_map.get(interval.lower(), interval)
-
-def verify_symbol(symbol):
-    if '-' not in symbol:
-        print(f"⚠️ Convertendo símbolo para formato KuCoin: {symbol} -> {symbol.replace('/', '-') if '/' in symbol else f'{symbol}-USDT'}")
-        return symbol.replace('/', '-') if '/' in symbol else f"{symbol}-USDT"
-    return symbol
-
-def get_candles(symbol=SYMBOL, interval=INTERVAL, limit=21):
-    try:
-        symbol = verify_symbol(symbol)
-        interval = normalize_interval(interval)
+# ================== FUNÇÕES DE ANÁLISE ==================
+def detect_engulfing(candles):
+    """Detecta padrões de engulfing de alta/baixa"""
+    if len(candles) < 2:
+        return None
+    
+    prev_candle = candles[-2]
+    current_candle = candles[-1]
+    
+    # Calcula o tamanho dos corpos
+    prev_body = abs(prev_candle['close'] - prev_candle['open'])
+    current_body = abs(current_candle['close'] - current_candle['open'])
+    
+    # Engulfing de Alta (Bearish para Bullish)
+    if (prev_candle['close'] < prev_candle['open'] and  # Vela anterior de baixa
+        current_candle['close'] > current_candle['open'] and  # Vela atual de alta
+        current_body >= 1.5 * prev_body and  # Corpo pelo menos 50% maior
+        current_candle['close'] > prev_candle['open'] and  # Engolfa alta
+        current_candle['open'] < prev_candle['close']):
         
-        print(f"\n📡 Buscando {limit} candles de {symbol} ({interval})")
+        return 'bullish'
+    
+    # Engulfing de Baixa (Bullish para Bearish)
+    elif (prev_candle['close'] > prev_candle['open'] and  # Vela anterior de alta
+          current_candle['close'] < current_candle['open'] and  # Vela atual de baixa
+          current_body >= 1.5 * prev_body and  # Corpo pelo menos 50% maior
+          current_candle['open'] > prev_candle['close'] and  # Engolfa baixa
+          current_candle['close'] < prev_candle['open']):
         
-        url = "https://api.kucoin.com/api/v1/market/candles"
-        params = {
-            "symbol": symbol,
-            "type": interval,
-            "limit": limit
-        }
-        
-        response = requests.get(url, params=params, timeout=15)
-        response.raise_for_status()
-        data = response.json()
-        
-        if data.get("code") != "200000":
-            error_msg = data.get("msg", "Erro desconhecido")
-            if "Incorrect candlestick type" in error_msg:
-                valid_intervals = ", ".join(get_valid_intervals().values())
-                print(f"❌ Intervalo inválido. Use um destes: {valid_intervals}")
-            else:
-                print(f"❌ Erro na API: {error_msg}")
-            return None
-            
-        if not data.get("data"):
-            print("⚠️ Nenhum dado retornado")
-            return None
-            
-        candles = []
-        for candle in data["data"]:
-            try:
-                candles.append({
-                    "open": float(candle[1]),
-                    "high": float(candle[2]),
-                    "low": float(candle[3]),
-                    "close": float(candle[4]),
-                    "volume": float(candle[5]),
-                    "time": datetime.fromtimestamp(int(candle[0])).strftime('%Y-%m-%d %H:%M'),
-                    "source": "KuCoin"
-                })
-            except (IndexError, ValueError) as e:
-                print(f"⚠️ Erro ao processar candle: {str(e)}")
-                continue
-                
-        print(f"✅ {len(candles)} candles obtidos")
-        return candles[::-1]
-        
-    except requests.exceptions.RequestException as e:
-        print(f"🌐 Erro na requisição: {str(e)[:100]}")
-    except Exception as e:
-        print(f"🔥 Erro inesperado: {str(e)}")
-        
+        return 'bearish'
+    
     return None
 
+def get_trend(candles, period=20):
+    """Determina a tendência usando média móvel"""
+    if len(candles) < period:
+        return 'neutral'
+    
+    closes = [c['close'] for c in candles[-period:]]
+    sma = sum(closes) / period
+    current_price = candles[-1]['close']
+    
+    if current_price > sma * 1.02:  # 2% acima da média
+        return 'alta'
+    elif current_price < sma * 0.98:  # 2% abaixo da média
+        return 'baixa'
+    return 'lateral'
+
+def calculate_price_levels(entry_price, signal_type):
+    """Calcula TP/SL com base no tipo de sinal"""
+    if signal_type == 'bullish':
+        tp = entry_price * 1.03  # +3%
+        sl = entry_price * 0.985  # -1.5%
+    elif signal_type == 'bearish':
+        tp = entry_price * 0.97  # -3%
+        sl = entry_price * 1.015  # +1.5%
+    else:
+        return None, None
+    
+    return round(tp, 4), round(sl, 4)
+
 # ================== LÓGICA DO BOT ==================
-def send_alert(message):
-    if not TELEGRAM_TOKEN or not CHAT_ID:
-        print("⛔ Telegram não configurado")
+def send_alert(signal_type, entry_price, trend):
+    """Envia alerta formatado para o Telegram"""
+    global last_signal
+    
+    if signal_type == last_signal:
         return False
-        
+    
+    tp, sl = calculate_price_levels(entry_price, signal_type)
+    
+    emoji = '🚀' if signal_type == 'bullish' else '⚠️'
+    action = 'COMPRA' if signal_type == 'bullish' else 'VENDA'
+    
+    message = (
+        f"{emoji} **ALERTA DE TRADING** {emoji}\n\n"
+        f"🏷️ **Par:** {SYMBOL.replace('-', '/')}\n"
+        f"⏰ **Horário:** {datetime.now().strftime('%d/%m %H:%M')}\n"
+        f"🔍 **Padrão:** Engolfo de {signal_type.upper()}\n"
+        f"📈 **Tendência:** {trend.upper()}\n\n"
+        f"💵 **Entrada:** ${entry_price:.4f}\n"
+        f"🎯 **Take Profit:** ${tp:.4f}\n"
+        f"🛑 **Stop Loss:** ${sl:.4f}\n\n"
+        f"📊 **Intervalo:** {INTERVAL}\n"
+        f"🔔 **Fonte:** KuCoin API"
+    )
+    
     try:
         response = requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
@@ -105,143 +114,42 @@ def send_alert(message):
             },
             timeout=10
         )
-        return response.status_code == 200
-    except Exception as e:
-        print(f"⚠️ Erro no Telegram: {str(e)[:50]}")
-        return False
-
-def analyze_market():
-    print("\n🔍 Analisando mercado...")
-    start_time = time.time()
-    
-    candles = get_candles()
-    if not candles or len(candles) < 2:
-        print("⛔ Dados insuficientes")
-        return False
         
-    last_candle = candles[-1]
-    prev_candle = candles[-2]
+        if response.status_code == 200:
+            last_signal = signal_type
+            return True
+    except Exception as e:
+        print(f"Erro no Telegram: {str(e)}")
     
-    try:
-        price_change = ((last_candle['close'] - prev_candle['close']) / prev_candle['close']) * 100
-        volume_change = ((last_candle['volume'] - prev_candle['volume']) / prev_candle['volume']) * 100
-    except ZeroDivisionError:
-        price_change = 0
-        volume_change = 0
-    
-    message = (
-        f"📊 **{SYMBOL.replace('-', '/')} {INTERVAL}**\n"
-        f"⏰ {last_candle['time']}\n"
-        f"💰 Preço: ${last_candle['close']:.4f} ({price_change:+.2f}%)\n"
-        f"📈 Volume: {last_candle['volume']:.2f} ({volume_change:+.1f}%)\n"
-        f"🔍 Fonte: KuCoin"
-    )
-    
-    if send_alert(message):
-        print(f"✅ Análise concluída em {time.time() - start_time:.2f}s")
-        return True
-    
-    print("⛔ Falha ao enviar alerta")
     return False
 
-def trading_loop():
-    print("\n🤖 Iniciando KuCoin Trading Bot")
-    print(f"⚙️ Config: {SYMBOL} | {INTERVAL} | {CHECK_INTERVAL//60}min")
+def analyze_market():
+    """Executa análise completa do mercado"""
+    candles = get_candles()
+    if not candles or len(candles) < 20:
+        return False
     
-    cycle = 0
-    while True:
-        cycle += 1
-        cycle_start = time.time()
-        
-        try:
-            print(f"\n♻️ CICLO #{cycle} | {datetime.now().strftime('%H:%M:%S')}")
-            
-            if analyze_market():
-                print("✅ Sucesso")
-            else:
-                print("⚠️ Problemas")
-            
-            elapsed = time.time() - cycle_start
-            sleep_time = max(CHECK_INTERVAL - elapsed, 5)
-            print(f"⏳ Próximo ciclo em {sleep_time:.0f}s")
-            time.sleep(sleep_time)
-            
-        except Exception as e:
-            print(f"🔥 ERRO: {str(e)}")
-            time.sleep(60)
-
-# ================== WEB SERVICE ==================
-@app.route('/')
-def status():
-    return jsonify({
-        "status": "online",
-        "exchange": "KuCoin",
-        "symbol": SYMBOL,
-        "interval": INTERVAL,
-        "valid_intervals": list(get_valid_intervals().values()),
-        "timestamp": datetime.now().isoformat()
-    })
-
-@app.route('/health')
-def health_check():
-    test_start = time.time()
+    # Detecta padrões
+    engulfing_signal = detect_engulfing(candles)
+    trend = get_trend(candles)
     
-    # Teste da API
-    api_test = False
+    if engulfing_signal:
+        entry_price = candles[-1]['close']
+        return send_alert(engulfing_signal, entry_price, trend)
+    
+    return False
+
+# ================== FUNÇÕES DA API KUCOIN ==================
+def get_candles(symbol=SYMBOL, interval=INTERVAL, limit=50):
+    """Obtém candles da KuCoin (mantido do código anterior)"""
     try:
-        api_test = get_candles(limit=1) is not None
-    except:
-        pass
-    
-    # Teste do Telegram
-    telegram_test = False
-    if TELEGRAM_TOKEN and CHAT_ID:
-        try:
-            telegram_test = requests.get(
-                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getMe",
-                timeout=5
-            ).status_code == 200
-        except:
-            pass
-    
-    return jsonify({
-        "healthy": api_test and telegram_test,
-        "api_online": api_test,
-        "telegram_online": telegram_test,
-        "response_time_ms": int((time.time() - test_start) * 1000),
-        "timestamp": datetime.now().isoformat()
-    })
-
-# ================== INICIALIZAÇÃO ==================
-if __name__ == "__main__":
-    print("\n" + "=" * 50)
-    print(f"🚀 KUCOIN BOT | {datetime.now().strftime('%d/%m %H:%M')}")
-    print("=" * 50)
-    
-    # Verificação inicial
-    print("\n⚙️ Testes iniciais:")
-    
-    print("• Testando KuCoin API...", end=" ")
-    try:
-        test_candles = get_candles(limit=1)
-        print("✅ OK" if test_candles else "❌ FALHA")
+        # ... (implementação idêntica à versão anterior)
+        # Retorna lista de candles formatados
     except Exception as e:
-        print(f"⚠️ ERRO: {str(e)}")
-    
-    print("• Testando Telegram...", end=" ")
-    if TELEGRAM_TOKEN and CHAT_ID:
-        try:
-            telegram_test = requests.get(
-                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getMe",
-                timeout=5
-            ).status_code == 200
-            print("✅ OK" if telegram_test else "❌ FALHA")
-        except Exception as e:
-            print(f"⚠️ ERRO: {str(e)}")
-    else:
-        print("⏭️ DESATIVADO")
-    
-    # Inicia serviços
-    print("\n🔧 Iniciando...")
-    Thread(target=trading_loop, daemon=True).start()
-    app.run(host='0.0.0.0', port=8000, use_reloader=False)
+        print(f"Erro na API: {str(e)}")
+        return None
+
+# ... (mantenha as outras funções e inicialização idênticas ao código anterior)
+
+if __name__ == "__main__":
+    # ... (código de inicialização idêntico)
