@@ -8,86 +8,195 @@ from flask import Flask, jsonify
 # Configurações
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
 CHAT_ID = os.getenv('CHAT_ID')
-SYMBOL = os.getenv('SYMBOL', 'SOLUSDT')
+SYMBOL = os.getenv('SYMBOL', 'BTCUSDT')  # Símbolo mais líquido
 INTERVAL = os.getenv('INTERVAL', '1h')
 CHECK_INTERVAL = int(os.getenv('CHECK_INTERVAL', '1800'))  # 30 minutos
 
 app = Flask(__name__)
 
-# ========== FUNÇÕES DO BOT ==========
-def get_candles():
-    """Versão simplificada apenas para teste"""
-    return [{
-        "open": 100.0,
-        "high": 105.0,
-        "low": 99.0,
-        "close": 103.0,
-        "time": datetime.now().strftime('%Y-%m-%d %H:%M'),
-        "source": "Simulado"
-    }]
+# ================== FUNÇÕES DE API ==================
+def get_binance_candles(symbol, interval, limit=21):
+    """Obtém candles da Binance com tratamento completo"""
+    try:
+        response = requests.get(
+            "https://api.binance.com/api/v3/klines",
+            params={
+                "symbol": symbol,
+                "interval": interval,
+                "limit": limit
+            },
+            headers={'User-Agent': 'Mozilla/5.0'},
+            timeout=10
+        )
+        
+        if response.status_code == 200:
+            return [{
+                "open": float(candle[1]),
+                "high": float(candle[2]),
+                "low": float(candle[3]),
+                "close": float(candle[4]),
+                "time": datetime.fromtimestamp(candle[0]/1000).strftime('%Y-%m-%d %H:%M'),
+                "source": "Binance"
+            } for candle in response.json()]
+    
+    except Exception as e:
+        print(f"Binance API Error: {str(e)[:100]}")
+    return None
 
-def send_telegram_alert(message):
-    """Versão simplificada para teste"""
-    print(f"📤 Mensagem simulada para Telegram: {message[:50]}...")
-    return True
+def get_bybit_candles(symbol, interval, limit=21):
+    """Fallback para Bybit com tratamento robusto"""
+    try:
+        # Converte intervalos (1h → 60)
+        interval_map = {'1h': '60', '4h': '240', '1d': 'D'}
+        bybit_interval = interval_map.get(interval, '60')
+        
+        response = requests.get(
+            "https://api.bybit.com/v5/market/kline",
+            params={
+                "category": "spot",
+                "symbol": symbol,
+                "interval": bybit_interval,
+                "limit": str(limit)
+            },
+            timeout=10
+        )
+        
+        if response.status_code == 200:
+            data = response.json()
+            if data.get("result", {}).get("list"):
+                return [{
+                    "open": float(candle["open"]),
+                    "high": float(candle["high"]),
+                    "low": float(candle["low"]),
+                    "close": float(candle["close"]),
+                    "time": datetime.fromtimestamp(int(candle["startTime"])/1000).strftime('%Y-%m-%d %H:%M'),
+                    "source": "Bybit"
+                } for candle in data["result"]["list"]]
+    
+    except Exception as e:
+        print(f"Bybit API Error: {str(e)[:100]}")
+    return None
+
+def get_market_data():
+    """Obtém dados com fallback automático"""
+    print("\n🔍 Buscando dados do mercado...")
+    
+    # Tenta Binance primeiro
+    data = get_binance_candles(SYMBOL, INTERVAL)
+    if data:
+        print(f"✅ Dados obtidos da Binance ({len(data)} candles)")
+        return data
+    
+    # Fallback para Bybit
+    print("🔁 Binance falhou, tentando Bybit...")
+    data = get_bybit_candles(SYMBOL, INTERVAL)
+    if data:
+        print(f"✅ Dados obtidos da Bybit ({len(data)} candles)")
+        return data
+    
+    print("❌ Todas as APIs falharam")
+    return None
+
+# ================== LÓGICA DO BOT ==================
+def send_alert(message):
+    """Envia alertas para o Telegram"""
+    try:
+        if not TELEGRAM_TOKEN or not CHAT_ID:
+            print("⚠️ Configurações do Telegram ausentes")
+            return False
+            
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+            json={
+                "chat_id": CHAT_ID,
+                "text": message,
+                "parse_mode": "Markdown"
+            },
+            timeout=5
+        )
+        print("📤 Alerta enviado")
+        return True
+    except Exception as e:
+        print(f"⚠️ Erro no Telegram: {str(e)[:100]}")
+        return False
+
+def analyze_market():
+    """Executa análise e envia alertas"""
+    data = get_market_data()
+    if not data:
+        return False
+    
+    last_candle = data[-1]
+    price_change = ((last_candle['close'] - data[-2]['close']) / data[-2]['close']) * 100
+    
+    message = (
+        f"📊 **{SYMBOL} {INTERVAL} Update**\n"
+        f"⏰ {last_candle['time']}\n"
+        f"💰 Preço: ${last_candle['close']:.2f}\n"
+        f"📈 Variação: {price_change:+.2f}%\n"
+        f"🔍 Fonte: {last_candle['source']}"
+    )
+    
+    return send_alert(message)
 
 def trading_loop():
-    """Loop principal com logging aprimorado"""
+    """Loop principal com logging detalhado"""
     print("\n🔄 Iniciando loop de trading...")
-    counter = 0
+    cycle = 0
     
     while True:
+        cycle += 1
+        start_time = time.time()
+        
         try:
-            counter += 1
-            print(f"\n🔁 Ciclo #{counter} - {datetime.now().strftime('%H:%M:%S')}")
+            print(f"\n♻️ Ciclo #{cycle} | {datetime.now().strftime('%H:%M:%S')}")
             
-            # Simula análise de mercado
-            candles = get_candles()
-            if candles:
-                last_price = candles[-1]['close']
-                print(f"📊 Preço simulado: {last_price}")
-                
-                if counter % 3 == 0:  # Envia alerta a cada 3 ciclos
-                    msg = f"Teste #{counter} | Preço: {last_price}"
-                    send_telegram_alert(msg)
+            if analyze_market():
+                print("✅ Análise concluída")
+            else:
+                print("⚠️ Falha na análise")
             
-            time.sleep(10)  # Intervalo reduzido para testes
+            # Calcula tempo restante do intervalo
+            elapsed = time.time() - start_time
+            sleep_time = max(CHECK_INTERVAL - elapsed, 5)
+            print(f"⏳ Próxima verificação em {sleep_time:.0f}s")
+            time.sleep(sleep_time)
             
         except Exception as e:
-            print(f"⚠️ Erro no ciclo {counter}: {str(e)}")
-            time.sleep(30)
+            print(f"🔥 Erro crítico: {str(e)}")
+            time.sleep(60)
 
-# ========== ROTAS FLASK ==========
+# ================== WEB SERVICE ==================
 @app.route('/')
 def home():
     return jsonify({
-        "status": "active",
-        "service": "Bot de Trading",
-        "last_activity": datetime.now().isoformat()
-    })
-
-@app.route('/status')
-def status():
-    return jsonify({
-        "running": True,
+        "status": "online",
+        "service": "Crypto Trading Bot",
         "symbol": SYMBOL,
-        "interval": INTERVAL
+        "interval": INTERVAL,
+        "timestamp": datetime.now().isoformat()
     })
 
-# ========== INICIALIZAÇÃO ==========
+@app.route('/health')
+def health_check():
+    return jsonify({"healthy": True, "time": datetime.now().isoformat()})
+
+# ================== INICIALIZAÇÃO ==================
 if __name__ == "__main__":
     # Configuração inicial
-    print("="*50)
-    print(f"🤖 Iniciando Bot de Trading - {datetime.now().strftime('%d/%m %H:%M')}")
+    print("\n" + "="*50)
+    print(f"🚀 Iniciando Crypto Bot - {datetime.now().strftime('%d/%m %H:%M')}")
     print(f"📈 Par: {SYMBOL} | Intervalo: {INTERVAL}")
-    print(f"🔄 Verificação a cada: {CHECK_INTERVAL//60} minutos")
-    print("="*50)
+    print(f"🔄 Ciclo: {CHECK_INTERVAL//60} minutos")
+    print("="*50 + "\n")
     
-    # Inicia o bot em thread separada
-    bot_thread = Thread(target=trading_loop, daemon=True)
-    bot_thread.start()
-    print("✅ Thread do bot iniciada")
+    # Teste inicial das APIs
+    print("⚙️ Testando conexões...")
+    print(f"Binance: {'✅' if get_binance_candles(SYMBOL, INTERVAL, 1) else '❌'}")
+    print(f"Bybit: {'✅' if get_bybit_candles(SYMBOL, INTERVAL, 1) else '❌'}")
     
-    # Inicia o servidor Flask
-    print("🌐 Iniciando servidor Flask...")
-    app.run(host='0.0.0.0', port=8000)
+    # Inicia o bot
+    Thread(target=trading_loop, daemon=True).start()
+    
+    # Inicia o Flask
+    app.run(host='0.0.0.0', port=8000, use_reloader=False)
