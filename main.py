@@ -1,86 +1,96 @@
+import os
 import requests
 import time
-import json
+from datetime import datetime
+from threading import Thread
+from flask import Flask, jsonify
 
-TELEGRAM_TOKEN = "7851489296:AAGdtlr5tlRWtZQ4DGAFligu0lx7CQhjmkM"
-CHAT_ID = "6197066344"
+# Configurações via variáveis de ambiente (NUNCA coloque dados sensíveis no código!)
+TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')  # Obrigatório no Render
+CHAT_ID = os.getenv('CHAT_ID')               # Obrigatório no Render
+SYMBOL = os.getenv('SYMBOL', 'SOLUSDT')      # Par padrão
+INTERVAL = os.getenv('INTERVAL', '1h')       # Tempo gráfico padrão
+CHECK_INTERVAL = int(os.getenv('CHECK_INTERVAL', '1800'))  # 30 minutos
 
-last_signal = None  # evitar alertas duplicados
+# Inicialização do Flask
+app = Flask(__name__)
+
+# Variável de estado
+last_signal = None
 
 def send_telegram_alert(message):
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {"chat_id": CHAT_ID, "text": message}
-    requests.post(url, data=payload)
+    """Envia mensagem para o Telegram com tratamento de erros"""
+    if not TELEGRAM_TOKEN or not CHAT_ID:
+        print("⚠️ Token ou Chat ID do Telegram não configurados!")
+        return None
 
-def get_candles(symbol="SOLUSDT", interval="1h", limit=21):
-    url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}"
-    response = requests.get(url)
-    data = response.json()
-    return [
-        {
-            "open": float(c[1]),
-            "high": float(c[2]),
-            "low": float(c[3]),
-            "close": float(c[4])
-        } for c in data
-    ]
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        payload = {
+            "chat_id": CHAT_ID,
+            "text": message,
+            "parse_mode": "Markdown"
+        }
+        response = requests.post(url, json=payload, timeout=10)
+        return response.json()
+    except Exception as e:
+        print(f"Erro ao enviar alerta: {e}")
+        return None
 
-def get_trend(candles):
-    closes = [c["close"] for c in candles[:-1]]
-    avg_old = sum(closes[:10]) / 10
-    avg_new = sum(closes[10:]) / 10
-    return "up" if avg_new > avg_old else "down"
+# ... (mantenha todas as outras funções IGUAIS ao código anterior: get_candles, get_trend, detect_engulfing, format_price)
 
-def detect_engulfing(c1, c2, type="bullish"):
-    if type == "bullish":
-        return c1["close"] < c1["open"] and c2["close"] > c2["open"] and c2["close"] > c1["open"] and c2["open"] < c1["close"]
-    elif type == "bearish":
-        return c1["close"] > c1["open"] and c2["close"] < c2["open"] and c2["open"] > c1["close"] and c2["close"] < c1["open"]
-    return False
-
-def main_loop():
+def trading_bot():
+    """Loop principal do bot"""
     global last_signal
+
+    print(f"\n🔍 Iniciando monitoramento de {SYMBOL} ({INTERVAL})")
+    print(f"⏳ Intervalo de verificação: {CHECK_INTERVAL//60} minutos")
+
     while True:
         try:
             candles = get_candles()
+            if not candles:
+                time.sleep(60)
+                continue
+
+            current = candles[-1]
+            previous = candles[-2]
             trend = get_trend(candles)
-            trend_text = "🔺 Alta" if trend == "up" else "🔻 Baixa"
+            trend_icon = "🔺" if trend == "up" else "🔻" if trend == "down" else "➖"
 
-            c1 = candles[-2]
-            c2 = candles[-1]
-            current_price = c2["close"]
-
-            # Engolfo de Alta
-            if detect_engulfing(c1, c2, "bullish") and last_signal != "bullish":
-                entry = round(current_price, 2)
-                tp = round(entry * 1.03, 2)
-                sl = round(entry * 0.985, 2)
-                msg = f"""🚨 [ALERTA] Engolfo de Alta detectado em SOL/USDT (1H)
-
-🟢 Tipo de entrada: Compra
-💰 Preço de entrada: ${entry}
-🎯 Take Profit (TP): ${tp} (+3%)
-🛡️ Stop Loss (SL): ${sl} (-1.5%)
-
-📊 Tendência principal: {trend_text}"""
-                send_telegram_alert(msg)
+            # Lógica de negociação (igual ao anterior)
+            if detect_engulfing(previous, current, "bullish") and last_signal != "bullish":
+                message = f"🚨 **ALERTA DE COMPRA** ({SYMBOL})..."
+                send_telegram_alert(message)
                 last_signal = "bullish"
 
-            # Engolfo de Baixa
-            elif detect_engulfing(c1, c2, "bearish") and last_signal != "bearish":
-                msg = f"""⚠️ [ALERTA] Engolfo de Baixa detectado em SOL/USDT (1H)
-
-🔴 Tipo de sinal: Reversão de alta ou saída
-💸 Preço atual: ${round(current_price, 2)}
-📊 Tendência principal: {trend_text}"""
-                send_telegram_alert(msg)
+            elif detect_engulfing(previous, current, "bearish") and last_signal != "bearish":
+                message = f"⚠️ **ALERTA DE VENDA** ({SYMBOL})..."
+                send_telegram_alert(message)
                 last_signal = "bearish"
 
-        except Exception as e:
-            print("Erro:", e)
+            time.sleep(CHECK_INTERVAL)
 
-        time.sleep(1800)  # espera 30 minutos
+        except Exception as e:
+            print(f"Erro no bot: {e}")
+            time.sleep(60)
+
+@app.route('/')
+def health_check():
+    """Rota para verificação de status"""
+    return jsonify({
+        "status": "active",
+        "symbol": SYMBOL,
+        "last_check": datetime.now().isoformat(),
+        "environment": "production" if os.getenv('RENDER') else "development"
+    })
 
 if __name__ == "__main__":
-    print("Bot de alerta SOL/USDT iniciado...")
-    main_loop()
+    # Verifica credenciais antes de iniciar
+    if not TELEGRAM_TOKEN or not CHAT_ID:
+        print("❌ ERRO: Variáveis TELEGRAM_TOKEN e CHAT_ID não configuradas!")
+        print("Configure-as no painel do Render -> Environment")
+    else:
+        Thread(target=trading_bot, daemon=True).start()
+    
+    app.run(host='0.0.0.0', port=8000)
